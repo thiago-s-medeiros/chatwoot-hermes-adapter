@@ -40,6 +40,10 @@ HERMES_MODEL = os.environ.get("HERMES_MODEL", "hermes-agent")
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "20"))
 FALLBACK_MESSAGE = os.environ.get("FALLBACK_MESSAGE", "Um instante! Vou te transferir para um atendente do nosso time. 🙏")
 DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "6"))
+# WhatsApp Cloud API direto: typing indicator NATIVO pro cliente (o Chatwoot nao repassa)
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
+WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v22.0")
 
 # estado em memoria (1 processo uvicorn): debounce por conversa
 _pending: dict = {}        # conversation_id -> asyncio.Task em andamento
@@ -152,6 +156,21 @@ async def set_typing(client, account_id, conversation_id, on):
         log.warning("toggle_typing falhou: %s", e)
 
 
+async def send_whatsapp_typing(wamid):
+    """Typing indicator NATIVO do WhatsApp (Meta) — Chatwoot nao repassa, entao chamamos a Graph API direto.
+    Tambem marca a msg como lida. Dura ~25s ou ate a resposta sair."""
+    if not (WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_TOKEN and wamid):
+        return
+    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    body = {"messaging_product": "whatsapp", "status": "read", "message_id": wamid, "typing_indicator": {"type": "text"}}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, json=body)
+            log.info("wa_typing -> %s %s", r.status_code, r.text[:150])
+    except Exception as e:
+        log.warning("wa_typing falhou: %s", e)
+
+
 async def process_conversation(account_id, conversation_id, contact_id):
     """Roda apos o debounce: 1 resposta por rajada, com o historico completo. Cancelavel
     (uma msg nova cancela este task e reagenda, juntando tudo)."""
@@ -215,6 +234,11 @@ async def webhook(request: Request):
         return {"ignored": "humano atribuido"}
     if status and status != "pending":
         return {"ignored": f"status={status} (fila humana)"}
+
+    # typing NATIVO do WhatsApp (imediato, pro cliente ver "digitando..." durante o debounce+processamento)
+    wamid = payload.get("source_id")
+    if wamid:
+        asyncio.create_task(send_whatsapp_typing(wamid))
 
     # DEBOUNCE: agrupa rajadas. Cada msg nova cancela o processamento anterior
     # (inclusive uma chamada a Eli em andamento) e reagenda; ao fim da janela,
