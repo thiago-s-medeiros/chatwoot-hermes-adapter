@@ -143,12 +143,22 @@ async def escalate_to_human(client, account_id, conversation_id):
         log.warning("escalate_to_human falhou: %s", e)
 
 
+async def set_typing(client, account_id, conversation_id, on):
+    """Liga/desliga o 'digitando...' na conversa enquanto a Eli processa."""
+    url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_typing_status"
+    try:
+        await client.post(url, headers={"api_access_token": READ_TOKEN}, json={"typing_status": "on" if on else "off"})
+    except Exception as e:
+        log.warning("toggle_typing falhou: %s", e)
+
+
 async def process_conversation(account_id, conversation_id, contact_id):
     """Roda apos o debounce: 1 resposta por rajada, com o historico completo. Cancelavel
     (uma msg nova cancela este task e reagenda, juntando tudo)."""
     try:
         await asyncio.sleep(DEBOUNCE_SECONDS)
         async with httpx.AsyncClient(timeout=180) as client:
+            await set_typing(client, account_id, conversation_id, True)  # "digitando..."
             escalate = False
             try:
                 messages = await fetch_history(client, account_id, conversation_id)
@@ -160,6 +170,7 @@ async def process_conversation(account_id, conversation_id, contact_id):
             except Exception as e:
                 log.exception("falha ao chamar o Hermes: %s", e)
                 reply, escalate = FALLBACK_MESSAGE, True
+            await set_typing(client, account_id, conversation_id, False)
             await send_text(client, account_id, conversation_id, reply)
             if escalate:
                 await escalate_to_human(client, account_id, conversation_id)
