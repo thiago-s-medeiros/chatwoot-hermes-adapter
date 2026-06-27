@@ -137,6 +137,17 @@ async def send_text(client, account_id, conversation_id, content):
     r.raise_for_status()
 
 
+async def send_note(client, account_id, conversation_id, content):
+    """Nota PRIVADA: so o atendente humano ve no Chatwoot; NAO vai pro cliente (WhatsApp)."""
+    url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
+    try:
+        r = await client.post(url, headers={"api_access_token": API_TOKEN},
+                              json={"content": content, "message_type": "outgoing", "private": True})
+        log.info("send_note -> %s", r.status_code)
+    except Exception as e:
+        log.warning("send_note falhou: %s", e)
+
+
 async def escalate_to_human(client, account_id, conversation_id):
     """Handoff: marca a conversa como 'open' pra entrar na fila dos atendentes humanos (sai do controle do bot)."""
     url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_status"
@@ -190,8 +201,22 @@ async def process_conversation(account_id, conversation_id, contact_id):
                 log.exception("falha ao chamar o Hermes: %s", e)
                 reply, escalate = FALLBACK_MESSAGE, True
             await set_typing(client, account_id, conversation_id, False)
-            await send_text(client, account_id, conversation_id, reply)
+            # separa: marcadores internos (NOTA/HANDOFF) NUNCA vao pro cliente
+            notes = re.findall(r"\[\[NOTA:\s*(.*?)\]\]", reply, re.DOTALL | re.IGNORECASE)
+            handoff = re.findall(r"\[\[HANDOFF:\s*(.*?)\]\]", reply, re.DOTALL | re.IGNORECASE)
+            customer_text = re.sub(r"\[\[.*?\]\]", "", reply, flags=re.DOTALL).strip()
+            # notas internas (lead etc.) -> nota privada
+            for n in notes:
+                if n.strip():
+                    await send_note(client, account_id, conversation_id, "🧾 " + n.strip())
+            # resposta pro cliente (sem marcadores)
+            if customer_text:
+                await send_text(client, account_id, conversation_id, customer_text)
+            # handoff: falha tecnica (escalate) OU decisao da Eli ([[HANDOFF]])
             if escalate:
+                await escalate_to_human(client, account_id, conversation_id)
+            elif handoff:
+                await send_note(client, account_id, conversation_id, "🤝 Handoff p/ humano: " + (handoff[0].strip() or "motivo nao informado"))
                 await escalate_to_human(client, account_id, conversation_id)
     except asyncio.CancelledError:
         log.info("conv %s: processamento cancelado (mensagem nova na rajada)", conversation_id)
