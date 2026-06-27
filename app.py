@@ -1,28 +1,27 @@
 """
-Adaptador Chatwoot -> (Hermes) -> Chatwoot  [PRIMEIRO TESTE]
-
-Objetivo deste primeiro corte:
-  1) RECEBER a mensagem do cliente pelo WEBHOOK do Chatwoot (Agent Bot).
-  2) RESPONDER via Application API — com um texto e o PDF do catalogo (anexo),
-     pra validar o envio de attachment via API.
+Adaptador Chatwoot <-> Hermes (atendente Elastok)
 
 Fluxo:
-  Cliente WhatsApp -> Chatwoot (inbox WhatsApp) -> [webhook Agent Bot] -> ESTE adaptador
-  ESTE adaptador -> POST /api/v1/accounts/{aid}/conversations/{cid}/messages -> Chatwoot -> WhatsApp
+  Cliente WhatsApp -> Chatwoot (inbox) -> [webhook Agent Bot] -> ESTE adaptador
+  adaptador: valida HMAC -> filtra (incoming, sem humano assumido) ->
+             busca historico no Chatwoot -> chama a api_server do Hermes (Eli) ->
+             posta a resposta de volta via Application API do Chatwoot -> WhatsApp
 
-O Hermes ainda NAO entra aqui (proximo passo: a funcao call_hermes()).
-
-Config por variaveis de ambiente:
-  CHATWOOT_BASE_URL    ex: https://chatwoot.enterpraiz.com  (ou http://chatwoot:3000 interno)
-  CHATWOOT_API_TOKEN   access_token do Agent Bot (ou de um agente)
-  CHATWOOT_HMAC_SECRET (opcional) secret do Agent Bot p/ validar X-Chatwoot-Signature
-  CATALOG_PDF_PATH     caminho do PDF dentro do container (ex: /data/CatalogoElastok.pdf)
-  TEST_SEND_PDF        "true" = envia o PDF em toda msg recebida (so p/ teste)
+Config por env:
+  CHATWOOT_BASE_URL    ex: https://chatwoot.enterpraiz.com
+  CHATWOOT_API_TOKEN   access_token do Agent Bot
+  CHATWOOT_HMAC_SECRET secret do Agent Bot (valida X-Chatwoot-Signature = HMAC(secret, "{ts}.{body}"))
+  HERMES_URL           ex: http://hermes-agent-xxxx:8642
+  HERMES_API_KEY       API_SERVER_KEY do Hermes
+  HERMES_MODEL         default "hermes-agent"
+  HISTORY_LIMIT        nº de mensagens de contexto (default 20)
+  FALLBACK_MESSAGE     msg enviada se o Hermes falhar
 """
 import hashlib
 import hmac
 import logging
 import os
+import re
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -33,53 +32,96 @@ log = logging.getLogger("adapter")
 BASE_URL = os.environ["CHATWOOT_BASE_URL"].rstrip("/")
 API_TOKEN = os.environ["CHATWOOT_API_TOKEN"]
 HMAC_SECRET = os.environ.get("CHATWOOT_HMAC_SECRET", "")
-CATALOG_PDF_PATH = os.environ.get("CATALOG_PDF_PATH", "/data/CatalogoElastok.pdf")
-TEST_SEND_PDF = os.environ.get("TEST_SEND_PDF", "true").lower() == "true"
+HERMES_URL = os.environ.get("HERMES_URL", "").rstrip("/")
+HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
+HERMES_MODEL = os.environ.get("HERMES_MODEL", "hermes-agent")
+HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "20"))
+FALLBACK_MESSAGE = os.environ.get("FALLBACK_MESSAGE", "Só um instante, já te respondo! 🙏")
 
 app = FastAPI(title="chatwoot-hermes-adapter")
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "pdf_present": os.path.exists(CATALOG_PDF_PATH), "base_url": BASE_URL}
+    return {"ok": True, "hermes_url": HERMES_URL, "base_url": BASE_URL}
 
 
 def _valid_signature(raw: bytes, sig_header: str, ts_header: str) -> bool:
-    """Valida a assinatura do Agent Bot do Chatwoot.
-    Chatwoot envia: X-Chatwoot-Signature = "sha256=" + HMAC_SHA256(secret, f"{X-Chatwoot-Timestamp}.{body}")."""
+    """Chatwoot: X-Chatwoot-Signature = "sha256=" + HMAC_SHA256(secret, f"{X-Chatwoot-Timestamp}.{body}")."""
     if not HMAC_SECRET:
-        return True  # validacao desativada enquanto nao houver secret configurado
+        return True
     if not sig_header:
         return False
-    signed = ts_header.encode() + b"." + raw  # "{timestamp}.{body}"
+    signed = ts_header.encode() + b"." + raw
     expected = hmac.new(HMAC_SECRET.encode(), signed, hashlib.sha256).hexdigest()
-    got = sig_header.split("=", 1)[-1].strip()  # Chatwoot manda "sha256=<hex>"
+    got = sig_header.split("=", 1)[-1].strip()
     return hmac.compare_digest(expected, got)
 
 
-async def send_text(client: httpx.AsyncClient, account_id, conversation_id, content: str):
+def _is_incoming(mtype) -> bool:
+    return mtype == "incoming" or mtype == 0
+
+
+def _is_outgoing(mtype) -> bool:
+    return mtype == "outgoing" or mtype == 1
+
+
+_THINK_RE = re.compile(r"<(think|thinking|reasoning|scratchpad)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+
+
+def clean_reply(text: str) -> str:
+    """So o texto final vai pro cliente: remove blocos de raciocinio/thinking."""
+    text = text or ""
+    text = _THINK_RE.sub("", text)
+    text = re.sub(r"</?(think|thinking|reasoning|scratchpad)>", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+async def fetch_history(client, account_id, conversation_id):
+    """Busca as mensagens da conversa no Chatwoot e monta o array de contexto pro LLM."""
+    url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
+    r = await client.get(url, headers={"api_access_token": API_TOKEN})
+    r.raise_for_status()
+    data = r.json()
+    items = data.get("payload") if isinstance(data, dict) else data
+    items = items or []
+    msgs = []
+    for m in items:
+        content = (m.get("content") or "").strip()
+        if not content or m.get("private"):
+            continue
+        mt = m.get("message_type")
+        if _is_incoming(mt):
+            msgs.append({"role": "user", "content": content})
+        elif _is_outgoing(mt):
+            msgs.append({"role": "assistant", "content": content})
+        # ignora activity/template
+    return msgs[-HISTORY_LIMIT:]
+
+
+async def call_hermes(client, session_key, messages):
+    url = f"{HERMES_URL}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {HERMES_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Hermes-Session-Key": session_key,  # memoria de longo prazo POR CONTATO
+    }
+    body = {"model": HERMES_MODEL, "messages": messages}
+    r = await client.post(url, headers=headers, json=body)
+    r.raise_for_status()
+    data = r.json()
+    return clean_reply(data["choices"][0]["message"]["content"])
+
+
+async def send_text(client, account_id, conversation_id, content):
     url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
     r = await client.post(
         url,
         headers={"api_access_token": API_TOKEN},
         json={"content": content, "message_type": "outgoing"},
     )
-    log.info("send_text -> %s %s", r.status_code, r.text[:300])
+    log.info("send_text -> %s", r.status_code)
     r.raise_for_status()
-
-
-async def send_pdf(client: httpx.AsyncClient, account_id, conversation_id, content: str):
-    url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
-    with open(CATALOG_PDF_PATH, "rb") as fh:
-        files = {"attachments[]": (os.path.basename(CATALOG_PDF_PATH), fh, "application/pdf")}
-        data = {"content": content, "message_type": "outgoing"}
-        r = await client.post(url, headers={"api_access_token": API_TOKEN}, data=data, files=files)
-    log.info("send_pdf -> %s %s", r.status_code, r.text[:300])
-    r.raise_for_status()
-
-
-# TODO (proximo passo): chamar o Hermes p/ gerar a resposta de verdade.
-# async def call_hermes(content: str, conversation_id) -> str: ...
 
 
 @app.post("/chatwoot/webhook")
@@ -96,24 +138,34 @@ async def webhook(request: Request):
     account = payload.get("account") or {}
     account_id = account.get("id") or conv.get("account_id")
     conversation_id = conv.get("id") or payload.get("conversation_id")
-    content = payload.get("content", "") or ""
-    status = conv.get("status")
-    log.info(
-        "event=%s mtype=%s status=%s conv=%s acc=%s content=%r",
-        event, mtype, status, conversation_id, account_id, content[:120],
-    )
+    content = (payload.get("content") or "").strip()
+    meta = conv.get("meta") or {}
+    assignee = meta.get("assignee") or conv.get("assignee_id")
+    sender = payload.get("sender") or meta.get("sender") or {}
+    contact_id = sender.get("id") or (conv.get("contact_inbox") or {}).get("source_id") or conversation_id
+    log.info("event=%s mtype=%s conv=%s contact=%s assignee=%s content=%r", event, mtype, conversation_id, contact_id, bool(assignee), content[:80])
 
-    # so age em mensagem NOVA de CLIENTE (evita loop com as proprias respostas outgoing)
-    if event != "message_created" or mtype != "incoming":
-        return {"ignored": True, "reason": "nao e message_created/incoming"}
+    # so age em mensagem NOVA de CLIENTE (evita loop com as proprias respostas)
+    if event != "message_created" or not _is_incoming(mtype):
+        return {"ignored": "nao e message_created/incoming"}
     if not (account_id and conversation_id):
-        log.warning("payload sem account/conversation id")
-        return {"ignored": True, "reason": "sem ids"}
+        return {"ignored": "sem ids"}
+    # HANDOFF: se um humano assumiu a conversa, o bot fica quieto
+    if assignee:
+        log.info("conversa %s tem humano atribuido -> bot em silencio", conversation_id)
+        return {"ignored": "humano no controle"}
 
     async with httpx.AsyncClient(timeout=180) as client:
-        # TODO: trocar por call_hermes(content, conversation_id)
-        await send_text(client, account_id, conversation_id, f"(teste) recebi: {content!r}")
-        if TEST_SEND_PDF and os.path.exists(CATALOG_PDF_PATH):
-            await send_pdf(client, account_id, conversation_id, "Segue nosso catalogo 📄")
+        try:
+            messages = await fetch_history(client, account_id, conversation_id)
+            if not messages:
+                messages = [{"role": "user", "content": content or "Olá"}]
+            reply = await call_hermes(client, f"chatwoot-contact-{contact_id}", messages)
+            if not reply:
+                reply = FALLBACK_MESSAGE
+        except Exception as e:
+            log.exception("falha ao chamar o Hermes: %s", e)
+            reply = FALLBACK_MESSAGE
+        await send_text(client, account_id, conversation_id, reply)
 
     return {"ok": True}
