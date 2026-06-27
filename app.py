@@ -17,6 +17,7 @@ Config por env:
   HISTORY_LIMIT        nº de mensagens de contexto (default 20)
   FALLBACK_MESSAGE     msg enviada se o Hermes falhar
 """
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -38,6 +39,11 @@ HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
 HERMES_MODEL = os.environ.get("HERMES_MODEL", "hermes-agent")
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "20"))
 FALLBACK_MESSAGE = os.environ.get("FALLBACK_MESSAGE", "Um instante! Vou te transferir para um atendente do nosso time. 🙏")
+DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "6"))
+
+# estado em memoria (1 processo uvicorn): debounce por conversa
+_pending: dict = {}        # conversation_id -> asyncio.Task em andamento
+_last_content: dict = {}   # conversation_id -> ultimo texto recebido (fallback)
 
 app = FastAPI(title="chatwoot-hermes-adapter")
 
@@ -137,6 +143,34 @@ async def escalate_to_human(client, account_id, conversation_id):
         log.warning("escalate_to_human falhou: %s", e)
 
 
+async def process_conversation(account_id, conversation_id, contact_id):
+    """Roda apos o debounce: 1 resposta por rajada, com o historico completo. Cancelavel
+    (uma msg nova cancela este task e reagenda, juntando tudo)."""
+    try:
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+        async with httpx.AsyncClient(timeout=180) as client:
+            escalate = False
+            try:
+                messages = await fetch_history(client, account_id, conversation_id)
+                if not messages:
+                    messages = [{"role": "user", "content": _last_content.get(conversation_id) or "Olá"}]
+                reply = await call_hermes(client, f"chatwoot-contact-{contact_id}", messages)
+                if not reply:
+                    reply, escalate = FALLBACK_MESSAGE, True
+            except Exception as e:
+                log.exception("falha ao chamar o Hermes: %s", e)
+                reply, escalate = FALLBACK_MESSAGE, True
+            await send_text(client, account_id, conversation_id, reply)
+            if escalate:
+                await escalate_to_human(client, account_id, conversation_id)
+    except asyncio.CancelledError:
+        log.info("conv %s: processamento cancelado (mensagem nova na rajada)", conversation_id)
+        raise
+    finally:
+        if _pending.get(conversation_id) is asyncio.current_task():
+            _pending.pop(conversation_id, None)
+
+
 @app.post("/chatwoot/webhook")
 async def webhook(request: Request):
     raw = await request.body()
@@ -171,21 +205,14 @@ async def webhook(request: Request):
     if status and status != "pending":
         return {"ignored": f"status={status} (fila humana)"}
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        escalate = False
-        try:
-            messages = await fetch_history(client, account_id, conversation_id)
-            if not messages:
-                messages = [{"role": "user", "content": content or "Olá"}]
-            reply = await call_hermes(client, f"chatwoot-contact-{contact_id}", messages)
-            if not reply:
-                reply, escalate = FALLBACK_MESSAGE, True
-        except Exception as e:
-            log.exception("falha ao chamar o Hermes: %s", e)
-            reply, escalate = FALLBACK_MESSAGE, True
-        await send_text(client, account_id, conversation_id, reply)
-        if escalate:
-            # bot nao deu conta -> joga pra um atendente humano (conversa vira 'open' na fila)
-            await escalate_to_human(client, account_id, conversation_id)
-
-    return {"ok": True}
+    # DEBOUNCE: agrupa rajadas. Cada msg nova cancela o processamento anterior
+    # (inclusive uma chamada a Eli em andamento) e reagenda; ao fim da janela,
+    # responde 1x com o historico completo (buscado do Chatwoot na hora).
+    _last_content[conversation_id] = content
+    old = _pending.get(conversation_id)
+    if old and not old.done():
+        old.cancel()
+    _pending[conversation_id] = asyncio.create_task(
+        process_conversation(account_id, conversation_id, contact_id)
+    )
+    return {"ok": True, "scheduled": True}
