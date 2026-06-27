@@ -31,12 +31,13 @@ log = logging.getLogger("adapter")
 
 BASE_URL = os.environ["CHATWOOT_BASE_URL"].rstrip("/")
 API_TOKEN = os.environ["CHATWOOT_API_TOKEN"]
+READ_TOKEN = os.environ.get("CHATWOOT_READ_TOKEN") or API_TOKEN  # token de AGENTE p/ ler historico (GET); bot token so posta
 HMAC_SECRET = os.environ.get("CHATWOOT_HMAC_SECRET", "")
 HERMES_URL = os.environ.get("HERMES_URL", "").rstrip("/")
 HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
 HERMES_MODEL = os.environ.get("HERMES_MODEL", "hermes-agent")
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "20"))
-FALLBACK_MESSAGE = os.environ.get("FALLBACK_MESSAGE", "Só um instante, já te respondo! 🙏")
+FALLBACK_MESSAGE = os.environ.get("FALLBACK_MESSAGE", "Um instante! Vou te transferir para um atendente do nosso time. 🙏")
 
 app = FastAPI(title="chatwoot-hermes-adapter")
 
@@ -78,25 +79,27 @@ def clean_reply(text: str) -> str:
 
 
 async def fetch_history(client, account_id, conversation_id):
-    """Busca as mensagens da conversa no Chatwoot e monta o array de contexto pro LLM."""
+    """Historico da conversa no Chatwoot (NAO-FATAL: se falhar, retorna [] e segue so com a msg atual)."""
     url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
-    r = await client.get(url, headers={"api_access_token": API_TOKEN})
-    r.raise_for_status()
-    data = r.json()
-    items = data.get("payload") if isinstance(data, dict) else data
-    items = items or []
-    msgs = []
-    for m in items:
-        content = (m.get("content") or "").strip()
-        if not content or m.get("private"):
-            continue
-        mt = m.get("message_type")
-        if _is_incoming(mt):
-            msgs.append({"role": "user", "content": content})
-        elif _is_outgoing(mt):
-            msgs.append({"role": "assistant", "content": content})
-        # ignora activity/template
-    return msgs[-HISTORY_LIMIT:]
+    try:
+        r = await client.get(url, headers={"api_access_token": READ_TOKEN})
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("payload") if isinstance(data, dict) else data
+        msgs = []
+        for m in (items or []):
+            content = (m.get("content") or "").strip()
+            if not content or m.get("private"):
+                continue
+            mt = m.get("message_type")
+            if _is_incoming(mt):
+                msgs.append({"role": "user", "content": content})
+            elif _is_outgoing(mt):
+                msgs.append({"role": "assistant", "content": content})
+        return msgs[-HISTORY_LIMIT:]
+    except Exception as e:
+        log.warning("fetch_history falhou (%s) — seguindo so com a mensagem atual", e)
+        return []
 
 
 async def call_hermes(client, session_key, messages):
@@ -124,6 +127,16 @@ async def send_text(client, account_id, conversation_id, content):
     r.raise_for_status()
 
 
+async def escalate_to_human(client, account_id, conversation_id):
+    """Handoff: marca a conversa como 'open' pra entrar na fila dos atendentes humanos (sai do controle do bot)."""
+    url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_status"
+    try:
+        r = await client.post(url, headers={"api_access_token": READ_TOKEN}, json={"status": "open"})
+        log.info("escalate_to_human (open) -> %s", r.status_code)
+    except Exception as e:
+        log.warning("escalate_to_human falhou: %s", e)
+
+
 @app.post("/chatwoot/webhook")
 async def webhook(request: Request):
     raw = await request.body()
@@ -141,31 +154,38 @@ async def webhook(request: Request):
     content = (payload.get("content") or "").strip()
     meta = conv.get("meta") or {}
     assignee = meta.get("assignee") or conv.get("assignee_id")
+    status = conv.get("status")
     sender = payload.get("sender") or meta.get("sender") or {}
     contact_id = sender.get("id") or (conv.get("contact_inbox") or {}).get("source_id") or conversation_id
-    log.info("event=%s mtype=%s conv=%s contact=%s assignee=%s content=%r", event, mtype, conversation_id, contact_id, bool(assignee), content[:80])
+    log.info("event=%s mtype=%s status=%s conv=%s contact=%s assignee=%s content=%r", event, mtype, status, conversation_id, contact_id, bool(assignee), content[:80])
 
     # so age em mensagem NOVA de CLIENTE (evita loop com as proprias respostas)
     if event != "message_created" or not _is_incoming(mtype):
         return {"ignored": "nao e message_created/incoming"}
     if not (account_id and conversation_id):
         return {"ignored": "sem ids"}
-    # HANDOFF: se um humano assumiu a conversa, o bot fica quieto
+    # HANDOFF: o bot so responde quando a conversa esta COM ELE (pending) e sem humano atribuido.
+    # Se um humano assumiu (assignee) ou ja foi pra fila humana (status != pending), fica quieto.
     if assignee:
-        log.info("conversa %s tem humano atribuido -> bot em silencio", conversation_id)
-        return {"ignored": "humano no controle"}
+        return {"ignored": "humano atribuido"}
+    if status and status != "pending":
+        return {"ignored": f"status={status} (fila humana)"}
 
     async with httpx.AsyncClient(timeout=180) as client:
+        escalate = False
         try:
             messages = await fetch_history(client, account_id, conversation_id)
             if not messages:
                 messages = [{"role": "user", "content": content or "Olá"}]
             reply = await call_hermes(client, f"chatwoot-contact-{contact_id}", messages)
             if not reply:
-                reply = FALLBACK_MESSAGE
+                reply, escalate = FALLBACK_MESSAGE, True
         except Exception as e:
             log.exception("falha ao chamar o Hermes: %s", e)
-            reply = FALLBACK_MESSAGE
+            reply, escalate = FALLBACK_MESSAGE, True
         await send_text(client, account_id, conversation_id, reply)
+        if escalate:
+            # bot nao deu conta -> joga pra um atendente humano (conversa vira 'open' na fila)
+            await escalate_to_human(client, account_id, conversation_id)
 
     return {"ok": True}
