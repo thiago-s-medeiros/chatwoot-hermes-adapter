@@ -44,14 +44,16 @@ def health():
     return {"ok": True, "pdf_present": os.path.exists(CATALOG_PDF_PATH), "base_url": BASE_URL}
 
 
-def _valid_signature(raw: bytes, header: str) -> bool:
-    """Valida HMAC-SHA256 do corpo cru com o secret do Agent Bot (X-Chatwoot-Signature)."""
+def _valid_signature(raw: bytes, sig_header: str, ts_header: str) -> bool:
+    """Valida a assinatura do Agent Bot do Chatwoot.
+    Chatwoot envia: X-Chatwoot-Signature = "sha256=" + HMAC_SHA256(secret, f"{X-Chatwoot-Timestamp}.{body}")."""
     if not HMAC_SECRET:
         return True  # validacao desativada enquanto nao houver secret configurado
-    if not header:
+    if not sig_header:
         return False
-    expected = hmac.new(HMAC_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-    got = header.split("=", 1)[-1].strip()  # Chatwoot manda "sha256=<hex>"
+    signed = ts_header.encode() + b"." + raw  # "{timestamp}.{body}"
+    expected = hmac.new(HMAC_SECRET.encode(), signed, hashlib.sha256).hexdigest()
+    got = sig_header.split("=", 1)[-1].strip()  # Chatwoot manda "sha256=<hex>"
     return hmac.compare_digest(expected, got)
 
 
@@ -83,7 +85,7 @@ async def send_pdf(client: httpx.AsyncClient, account_id, conversation_id, conte
 @app.post("/chatwoot/webhook")
 async def webhook(request: Request):
     raw = await request.body()
-    if not _valid_signature(raw, request.headers.get("X-Chatwoot-Signature", "")):
+    if not _valid_signature(raw, request.headers.get("X-Chatwoot-Signature", ""), request.headers.get("X-Chatwoot-Timestamp", "")):
         log.warning("assinatura invalida — rejeitando")
         return Response(status_code=401)
 
