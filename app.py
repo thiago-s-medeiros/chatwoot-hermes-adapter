@@ -44,6 +44,8 @@ DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "6"))
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v22.0")
+# PDF do catalogo (embutido na imagem); enviado quando a Eli emite o marcador [[CATALOGO]]
+CATALOG_PDF_PATH = os.environ.get("CATALOG_PDF_PATH", "/app/CatalogoElastok.pdf")
 
 # estado em memoria (1 processo uvicorn): debounce por conversa
 _pending: dict = {}        # conversation_id -> asyncio.Task em andamento
@@ -148,6 +150,25 @@ async def send_note(client, account_id, conversation_id, content):
         log.warning("send_note falhou: %s", e)
 
 
+async def send_catalog(client, account_id, conversation_id):
+    """Envia o PDF do catalogo como ANEXO (Application API, multipart) -> vai pro cliente no WhatsApp."""
+    if not os.path.exists(CATALOG_PDF_PATH):
+        log.warning("catalogo nao encontrado em %s — pulando envio", CATALOG_PDF_PATH)
+        return False
+    url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
+    try:
+        with open(CATALOG_PDF_PATH, "rb") as fh:
+            files = {"attachments[]": (os.path.basename(CATALOG_PDF_PATH), fh, "application/pdf")}
+            r = await client.post(url, headers={"api_access_token": API_TOKEN},
+                                  data={"message_type": "outgoing"}, files=files)
+        log.info("send_catalog -> %s", r.status_code)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("send_catalog falhou: %s", e)
+        return False
+
+
 async def escalate_to_human(client, account_id, conversation_id):
     """Handoff: marca a conversa como 'open' pra entrar na fila dos atendentes humanos (sai do controle do bot)."""
     url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_status"
@@ -204,6 +225,7 @@ async def process_conversation(account_id, conversation_id, contact_id):
             # separa: marcadores internos (NOTA/HANDOFF) NUNCA vao pro cliente
             notes = re.findall(r"\[\[NOTA:\s*(.*?)\]\]", reply, re.DOTALL | re.IGNORECASE)
             handoff = re.findall(r"\[\[HANDOFF:\s*(.*?)\]\]", reply, re.DOTALL | re.IGNORECASE)
+            wants_catalog = bool(re.search(r"\[\[CATALOGO\]\]", reply, re.IGNORECASE))
             customer_text = re.sub(r"\[\[.*?\]\]", "", reply, flags=re.DOTALL).strip()
             # notas internas (lead etc.) -> nota privada
             for n in notes:
@@ -212,6 +234,9 @@ async def process_conversation(account_id, conversation_id, contact_id):
             # resposta pro cliente (sem marcadores)
             if customer_text:
                 await send_text(client, account_id, conversation_id, customer_text)
+            # catalogo: a Eli pediu p/ enviar o PDF -> anexa na conversa (vai pro WhatsApp)
+            if wants_catalog:
+                await send_catalog(client, account_id, conversation_id)
             # handoff: falha tecnica (escalate) OU decisao da Eli ([[HANDOFF]])
             if escalate:
                 await escalate_to_human(client, account_id, conversation_id)
