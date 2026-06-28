@@ -44,8 +44,9 @@ DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "6"))
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v22.0")
-# PDF do catalogo (embutido na imagem); enviado quando a Eli emite o marcador [[CATALOGO]]
-CATALOG_PDF_PATH = os.environ.get("CATALOG_PDF_PATH", "/app/CatalogoElastok.pdf")
+# PDF do catalogo (embutido na imagem); enviado quando a Eli emite o marcador [[CATALOGO]].
+# Tenta o env, depois caminhos embutidos — robusto a env desatualizado.
+CATALOG_PDF_PATHS = [p for p in [os.environ.get("CATALOG_PDF_PATH"), "/app/CatalogoElastok.pdf", "/data/CatalogoElastok.pdf"] if p]
 
 # estado em memoria (1 processo uvicorn): debounce por conversa
 _pending: dict = {}        # conversation_id -> asyncio.Task em andamento
@@ -152,13 +153,14 @@ async def send_note(client, account_id, conversation_id, content):
 
 async def send_catalog(client, account_id, conversation_id):
     """Envia o PDF do catalogo como ANEXO (Application API, multipart) -> vai pro cliente no WhatsApp."""
-    if not os.path.exists(CATALOG_PDF_PATH):
-        log.warning("catalogo nao encontrado em %s — pulando envio", CATALOG_PDF_PATH)
+    path = next((p for p in CATALOG_PDF_PATHS if os.path.exists(p)), None)
+    if not path:
+        log.warning("catalogo nao encontrado em %s — pulando envio", CATALOG_PDF_PATHS)
         return False
     url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
     try:
-        with open(CATALOG_PDF_PATH, "rb") as fh:
-            files = {"attachments[]": (os.path.basename(CATALOG_PDF_PATH), fh, "application/pdf")}
+        with open(path, "rb") as fh:
+            files = {"attachments[]": (os.path.basename(path), fh, "application/pdf")}
             r = await client.post(url, headers={"api_access_token": API_TOKEN},
                                   data={"message_type": "outgoing"}, files=files)
         log.info("send_catalog -> %s", r.status_code)
