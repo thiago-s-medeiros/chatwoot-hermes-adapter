@@ -210,6 +210,18 @@ async def assign_team(client, account_id, conversation_id, team_id):
         log.warning("assign_team falhou: %s", e)
 
 
+async def team_has_online_agent(client, account_id, team_id):
+    """True se algum agente do time está disponível (online/busy). Em erro, assume disponível."""
+    url = f"{BASE_URL}/api/v1/accounts/{account_id}/teams/{team_id}/team_members"
+    try:
+        r = await client.get(url, headers={"api_access_token": READ_TOKEN})
+        r.raise_for_status()
+        return any((m.get("availability_status") in ("online", "busy")) for m in (r.json() or []))
+    except Exception as e:
+        log.warning("team_has_online_agent falhou: %s — assumindo disponível", e)
+        return True
+
+
 async def set_typing(client, account_id, conversation_id, on):
     """Liga/desliga o 'digitando...' na conversa enquanto a Eli processa."""
     url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_typing_status"
@@ -258,32 +270,41 @@ async def process_conversation(account_id, conversation_id, contact_id):
             handoff = re.findall(r"\[\[HANDOFF:\s*(.*?)\]\]", reply, re.DOTALL | re.IGNORECASE)
             wants_catalog = bool(re.search(r"\[\[CATALOGO\]\]", reply, re.IGNORECASE))
             customer_text = re.sub(r"\[\[.*?\]\]", "", reply, flags=re.DOTALL).strip()
+            # parse do handoff (time + motivo) ANTES de responder, p/ checar disponibilidade do time
+            team_name, reason, team_id = None, None, None
+            if handoff:
+                raw = handoff[0].strip()
+                reason = raw
+                if "|" in raw:
+                    cand, rest = raw.split("|", 1)
+                    if cand.strip().lower() in ("comercial", "financeiro"):
+                        team_name, reason = cand.strip().lower(), rest.strip()
+            # se vai transbordar p/ um time SEM ninguem online, avisa o cliente
+            offline_notice = ""
+            if team_name and not escalate:
+                team_id = await get_team_id(client, account_id, team_name)
+                if team_id and not await team_has_online_agent(client, account_id, team_id):
+                    offline_notice = (" Só pra te avisar: nossa equipe não está online neste exato momento,"
+                                      " mas assim que alguém estiver disponível já te atende por aqui, tá? 🙏")
             # notas internas (lead etc.) -> nota privada
             for n in notes:
                 if n.strip():
                     await send_note(client, account_id, conversation_id, "🧾 " + n.strip())
-            # resposta pro cliente (sem marcadores)
-            if customer_text:
-                await send_text(client, account_id, conversation_id, customer_text)
-            # catalogo: a Eli pediu p/ enviar o PDF -> anexa na conversa (vai pro WhatsApp)
+            # resposta pro cliente (sem marcadores) + aviso de indisponibilidade se for o caso
+            final_text = (customer_text + offline_notice).strip()
+            if final_text:
+                await send_text(client, account_id, conversation_id, final_text)
+            # catalogo: a Elai pediu p/ enviar o PDF -> anexa na conversa (vai pro WhatsApp)
             if wants_catalog:
                 await send_catalog(client, account_id, conversation_id)
             # handoff: falha tecnica (escalate) OU decisao da Elai ([[HANDOFF: <time> | <motivo>]])
             if escalate:
                 await escalate_to_human(client, account_id, conversation_id)
             elif handoff:
-                raw = handoff[0].strip()
-                team_name, reason = None, raw
-                if "|" in raw:
-                    cand, rest = raw.split("|", 1)
-                    if cand.strip().lower() in ("comercial", "financeiro"):
-                        team_name, reason = cand.strip().lower(), rest.strip()
                 nota = "🤝 Handoff p/ humano" + (f" — time {team_name}" if team_name else "") + ": " + (reason or "motivo nao informado")
                 await send_note(client, account_id, conversation_id, nota)
-                if team_name:
-                    tid = await get_team_id(client, account_id, team_name)
-                    if tid:
-                        await assign_team(client, account_id, conversation_id, tid)
+                if team_id:
+                    await assign_team(client, account_id, conversation_id, team_id)
                 await escalate_to_human(client, account_id, conversation_id)
     except asyncio.CancelledError:
         log.info("conv %s: processamento cancelado (mensagem nova na rajada)", conversation_id)
