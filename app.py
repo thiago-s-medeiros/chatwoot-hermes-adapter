@@ -181,6 +181,35 @@ async def escalate_to_human(client, account_id, conversation_id):
         log.warning("escalate_to_human falhou: %s", e)
 
 
+_team_cache: dict = {}  # nome(lower) -> team_id (cacheado)
+
+
+async def get_team_id(client, account_id, name):
+    """Resolve nome do time -> id (cacheado). Usa token de AGENTE (READ_TOKEN)."""
+    if not _team_cache:
+        try:
+            r = await client.get(f"{BASE_URL}/api/v1/accounts/{account_id}/teams",
+                                 headers={"api_access_token": READ_TOKEN})
+            r.raise_for_status()
+            for t in (r.json() or []):
+                if t.get("name"):
+                    _team_cache[t["name"].strip().lower()] = t["id"]
+            log.info("times carregados: %s", _team_cache)
+        except Exception as e:
+            log.warning("get_team_id falhou: %s", e)
+    return _team_cache.get((name or "").strip().lower())
+
+
+async def assign_team(client, account_id, conversation_id, team_id):
+    """Atribui a conversa a um TIME (entra na fila; auto-assign pega o agente do time)."""
+    url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/assignments"
+    try:
+        r = await client.post(url, headers={"api_access_token": READ_TOKEN}, json={"team_id": team_id})
+        log.info("assign_team(%s) -> %s", team_id, r.status_code)
+    except Exception as e:
+        log.warning("assign_team falhou: %s", e)
+
+
 async def set_typing(client, account_id, conversation_id, on):
     """Liga/desliga o 'digitando...' na conversa enquanto a Eli processa."""
     url = f"{BASE_URL}/api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_typing_status"
@@ -239,11 +268,22 @@ async def process_conversation(account_id, conversation_id, contact_id):
             # catalogo: a Eli pediu p/ enviar o PDF -> anexa na conversa (vai pro WhatsApp)
             if wants_catalog:
                 await send_catalog(client, account_id, conversation_id)
-            # handoff: falha tecnica (escalate) OU decisao da Eli ([[HANDOFF]])
+            # handoff: falha tecnica (escalate) OU decisao da Elai ([[HANDOFF: <time> | <motivo>]])
             if escalate:
                 await escalate_to_human(client, account_id, conversation_id)
             elif handoff:
-                await send_note(client, account_id, conversation_id, "🤝 Handoff p/ humano: " + (handoff[0].strip() or "motivo nao informado"))
+                raw = handoff[0].strip()
+                team_name, reason = None, raw
+                if "|" in raw:
+                    cand, rest = raw.split("|", 1)
+                    if cand.strip().lower() in ("comercial", "financeiro"):
+                        team_name, reason = cand.strip().lower(), rest.strip()
+                nota = "🤝 Handoff p/ humano" + (f" — time {team_name}" if team_name else "") + ": " + (reason or "motivo nao informado")
+                await send_note(client, account_id, conversation_id, nota)
+                if team_name:
+                    tid = await get_team_id(client, account_id, team_name)
+                    if tid:
+                        await assign_team(client, account_id, conversation_id, tid)
                 await escalate_to_human(client, account_id, conversation_id)
     except asyncio.CancelledError:
         log.info("conv %s: processamento cancelado (mensagem nova na rajada)", conversation_id)
