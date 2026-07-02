@@ -279,6 +279,11 @@ async def process_conversation(account_id, conversation_id, contact_id):
                     cand, rest = raw.split("|", 1)
                     if cand.strip().lower() in ("comercial", "financeiro"):
                         team_name, reason = cand.strip().lower(), rest.strip()
+                if team_name is None:
+                    # a Elai esqueceu o time no marcador — TODO handoff precisa de time.
+                    # Default: comercial (mesma regra do SOUL p/ caso ambiguo).
+                    team_name = "comercial"
+                    log.warning("handoff sem time valido (%r) — usando default 'comercial'", raw[:80])
             # se vai transbordar p/ um time SEM ninguem online, avisa o cliente
             offline_notice = ""
             if team_name and not escalate:
