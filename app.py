@@ -20,6 +20,7 @@ Config por env:
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -44,6 +45,12 @@ DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "6"))
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v22.0")
+# Credenciais WhatsApp POR INBOX (produção vs teste). JSON: {"<inbox_id>": {"pnid": "...", "token": "..."}}
+# Se o inbox nao estiver no mapa, cai no WHATSAPP_PHONE_NUMBER_ID/WHATSAPP_TOKEN acima.
+try:
+    _WA_INBOX_CREDS = json.loads(os.environ.get("WHATSAPP_INBOX_CREDS") or "{}")
+except Exception:
+    _WA_INBOX_CREDS = {}
 # PDF do catalogo (embutido na imagem); enviado quando a Eli emite o marcador [[CATALOGO]].
 # Tenta o env, depois caminhos embutidos — robusto a env desatualizado.
 CATALOG_PDF_PATHS = [p for p in [os.environ.get("CATALOG_PDF_PATH"), "/app/CatalogoElastok.pdf", "/data/CatalogoElastok.pdf"] if p]
@@ -231,17 +238,26 @@ async def set_typing(client, account_id, conversation_id, on):
         log.warning("toggle_typing falhou: %s", e)
 
 
-async def send_whatsapp_typing(wamid):
+def _wa_creds(inbox_id):
+    """(phone_number_id, token) por inbox; fallback p/ os envs unicos."""
+    c = _WA_INBOX_CREDS.get(str(inbox_id)) if inbox_id is not None else None
+    if c and c.get("pnid") and c.get("token"):
+        return c["pnid"], c["token"]
+    return WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN
+
+
+async def send_whatsapp_typing(wamid, inbox_id=None):
     """Typing indicator NATIVO do WhatsApp (Meta) — Chatwoot nao repassa, entao chamamos a Graph API direto.
-    Tambem marca a msg como lida. Dura ~25s ou ate a resposta sair."""
-    if not (WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_TOKEN and wamid):
+    Tambem marca a msg como lida. Dura ~25s ou ate a resposta sair. Credenciais POR INBOX (prod vs teste)."""
+    pnid, token = _wa_creds(inbox_id)
+    if not (pnid and token and wamid):
         return
-    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{pnid}/messages"
     body = {"messaging_product": "whatsapp", "status": "read", "message_id": wamid, "typing_indicator": {"type": "text"}}
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.post(url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, json=body)
-            log.info("wa_typing -> %s %s", r.status_code, r.text[:150])
+            r = await c.post(url, headers={"Authorization": f"Bearer {token}"}, json=body)
+            log.info("wa_typing(inbox=%s) -> %s %s", inbox_id, r.status_code, r.text[:150])
     except Exception as e:
         log.warning("wa_typing falhou: %s", e)
 
@@ -354,9 +370,10 @@ async def webhook(request: Request):
         return {"ignored": f"status={status} (fila humana)"}
 
     # typing NATIVO do WhatsApp (imediato, pro cliente ver "digitando..." durante o debounce+processamento)
+    inbox_id = conv.get("inbox_id") or (payload.get("inbox") or {}).get("id")
     wamid = payload.get("source_id")
     if wamid:
-        asyncio.create_task(send_whatsapp_typing(wamid))
+        asyncio.create_task(send_whatsapp_typing(wamid, inbox_id))
 
     # DEBOUNCE: agrupa rajadas. Cada msg nova cancela o processamento anterior
     # (inclusive uma chamada a Eli em andamento) e reagenda; ao fim da janela,
